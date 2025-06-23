@@ -44,14 +44,16 @@ type PlayerState struct {
 	ShuffleOrder     []int     `json:"shuffle_order"`
 	ShuffleIndex     int       `json:"shuffle_index"`
 	LastUpdated      time.Time `json:"last_updated"`
+	Position         int       `json:"position"` // Current position in seconds
 }
 
 // Config holds application configuration
 type Config struct {
-	DataDir   string
-	StateFile string
-	Playlists map[string]*Playlist
-	State     *PlayerState
+	DataDir    string
+	StateFile  string
+	SocketFile string
+	Playlists  map[string]*Playlist
+	State      *PlayerState
 }
 
 var (
@@ -136,17 +138,20 @@ func initConfig() (*Config, error) {
 	}
 
 	stateFile := filepath.Join(dataDir, "state.json")
+	socketFile := filepath.Join(dataDir, "mpv-socket")
 	playlistsFile := filepath.Join(dataDir, "playlists.json")
 
 	config := &Config{
-		DataDir:   dataDir,
-		StateFile: stateFile,
-		Playlists: make(map[string]*Playlist),
+		DataDir:    dataDir,
+		StateFile:  stateFile,
+		SocketFile: socketFile,
+		Playlists:  make(map[string]*Playlist),
 		State: &PlayerState{
 			Volume:           70,
 			CurrentSongIndex: 0,
 			ShuffleOrder:     []int{},
 			ShuffleIndex:     0,
+			Position:         0,
 		},
 	}
 
@@ -186,13 +191,21 @@ func setupSignalHandler() {
 	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
 	go func() {
 		<-c
-		if currentCmd != nil && currentCmd.Process != nil {
-			currentCmd.Process.Kill()
-		}
-		config.State.IsPlaying = false
-		saveConfig()
+		cleanup()
 		os.Exit(0)
 	}()
+}
+
+func cleanup() {
+	if currentCmd != nil && currentCmd.Process != nil {
+		// Send quit command to mpv
+		sendMpvCommand("quit")
+		currentCmd.Process.Kill()
+	}
+	config.State.IsPlaying = false
+	saveConfig()
+	// Clean up socket file
+	os.Remove(config.SocketFile)
 }
 
 func handleAdd(args []string) {
@@ -258,6 +271,7 @@ func handlePlay(args []string) {
 		}
 		config.State.CurrentPlaylist = playlistName
 		config.State.CurrentSongIndex = 0
+		config.State.Position = 0
 
 		// Initialize shuffle order if shuffle is enabled
 		if config.State.IsShuffle {
@@ -276,11 +290,26 @@ func handlePlay(args []string) {
 
 func handleStop() {
 	if currentCmd != nil && currentCmd.Process != nil {
-		currentCmd.Process.Kill()
+		// Send quit command to mpv first for graceful shutdown
+		sendMpvCommand("quit")
+
+		// Wait a moment for graceful shutdown
+		time.Sleep(100 * time.Millisecond)
+
+		// Force kill if still running
+		if currentCmd.Process != nil {
+			currentCmd.Process.Kill()
+		}
 		currentCmd = nil
 	}
+
 	config.State.IsPlaying = false
+	config.State.Position = 0
 	saveConfig()
+
+	// Clean up socket file
+	os.Remove(config.SocketFile)
+
 	fmt.Println("Playback stopped")
 }
 
@@ -290,7 +319,35 @@ func handleNext() {
 		return
 	}
 
-	skipChannel <- true
+	// Update our internal state first
+	playlist := config.Playlists[config.State.CurrentPlaylist]
+	if playlist != nil {
+		if config.State.IsShuffle {
+			config.State.ShuffleIndex++
+			if config.State.ShuffleIndex >= len(config.State.ShuffleOrder) {
+				if config.State.IsLoop {
+					config.State.ShuffleIndex = 0
+				} else {
+					handleStop()
+					return
+				}
+			}
+		} else {
+			config.State.CurrentSongIndex++
+			if config.State.CurrentSongIndex >= len(playlist.Songs) {
+				if config.State.IsLoop {
+					config.State.CurrentSongIndex = 0
+				} else {
+					handleStop()
+					return
+				}
+			}
+		}
+	}
+
+	// Force skip to next song immediately
+	sendMpvCommand("playlist-next")
+	saveConfig()
 	fmt.Println("Skipping to next song...")
 }
 
@@ -300,18 +357,33 @@ func handlePrevious() {
 		return
 	}
 
-	// Go to previous song
-	if config.State.IsShuffle {
-		if config.State.ShuffleIndex > 0 {
+	// Update our internal state first
+	playlist := config.Playlists[config.State.CurrentPlaylist]
+	if playlist != nil {
+		if config.State.IsShuffle {
 			config.State.ShuffleIndex--
-		}
-	} else {
-		if config.State.CurrentSongIndex > 0 {
+			if config.State.ShuffleIndex < 0 {
+				if config.State.IsLoop {
+					config.State.ShuffleIndex = len(config.State.ShuffleOrder) - 1
+				} else {
+					config.State.ShuffleIndex = 0
+				}
+			}
+		} else {
 			config.State.CurrentSongIndex--
+			if config.State.CurrentSongIndex < 0 {
+				if config.State.IsLoop {
+					config.State.CurrentSongIndex = len(playlist.Songs) - 1
+				} else {
+					config.State.CurrentSongIndex = 0
+				}
+			}
 		}
 	}
 
-	skipChannel <- true
+	// Force skip to previous song immediately
+	sendMpvCommand("playlist-prev")
+	saveConfig()
 	fmt.Println("Going to previous song...")
 }
 
@@ -344,6 +416,13 @@ func handleCurrent() {
 	fmt.Printf("  Duration: %s\n", song.Duration)
 	fmt.Printf("  Position: %d/%d in playlist\n", currentIndex+1, len(playlist.Songs))
 	fmt.Printf("  Playlist: %s\n", config.State.CurrentPlaylist)
+
+	// Try to get current position from mpv
+	if config.State.IsPlaying {
+		if pos := getMpvPosition(); pos >= 0 {
+			fmt.Printf("  Time: %s\n", formatDuration(pos))
+		}
+	}
 }
 
 func handleQueue(args []string) {
@@ -455,10 +534,12 @@ func handleJump(args []string) {
 	}
 
 	if config.State.IsPlaying {
-		skipChannel <- true
+		// Jump to the song in mpv playlist
+		sendMpvCommand(fmt.Sprintf("set playlist-pos %d", targetIndex))
 	}
 
 	fmt.Printf("Jumped to song %d: %s\n", songNum, playlist.Songs[targetIndex].Title)
+	saveConfig()
 }
 
 func handleShuffle(args []string) {
@@ -479,8 +560,14 @@ func handleShuffle(args []string) {
 
 	if config.State.IsShuffle {
 		initShuffleOrder()
+		if config.State.IsPlaying {
+			sendMpvCommand("set shuffle yes")
+		}
 		fmt.Println("Shuffle: ON")
 	} else {
+		if config.State.IsPlaying {
+			sendMpvCommand("set shuffle no")
+		}
 		fmt.Println("Shuffle: OFF")
 	}
 
@@ -504,8 +591,14 @@ func handleLoop(args []string) {
 	}
 
 	if config.State.IsLoop {
+		if config.State.IsPlaying {
+			sendMpvCommand("set loop-playlist inf")
+		}
 		fmt.Println("Loop: ON")
 	} else {
+		if config.State.IsPlaying {
+			sendMpvCommand("set loop-playlist no")
+		}
 		fmt.Println("Loop: OFF")
 	}
 
@@ -543,6 +636,11 @@ func handleVolume(args []string) {
 		}
 	}
 
+	// Set volume in mpv if playing
+	if config.State.IsPlaying {
+		sendMpvCommand(fmt.Sprintf("set volume %d", config.State.Volume))
+	}
+
 	fmt.Printf("Volume set to: %d%%\n", config.State.Volume)
 	saveConfig()
 }
@@ -553,9 +651,42 @@ func handleSeek(args []string) {
 		return
 	}
 
-	// This is a placeholder - actual seeking would require more complex mpv integration
-	fmt.Printf("Seek functionality not yet implemented with basic audio playback\n")
-	fmt.Printf("Requested: %s seconds\n", args[0])
+	if !config.State.IsPlaying {
+		fmt.Println("No music is currently playing")
+		return
+	}
+
+	seekArg := args[0]
+	var seekSeconds int
+	var err error
+	var relative bool
+
+	if strings.HasPrefix(seekArg, "+") || strings.HasPrefix(seekArg, "-") {
+		relative = true
+		seekSeconds, err = strconv.Atoi(seekArg[1:])
+		if strings.HasPrefix(seekArg, "-") {
+			seekSeconds = -seekSeconds
+		}
+	} else {
+		seekSeconds, err = strconv.Atoi(seekArg)
+	}
+
+	if err != nil {
+		fmt.Println("Invalid seek value")
+		return
+	}
+
+	if relative {
+		sendMpvCommand(fmt.Sprintf("seek %d", seekSeconds))
+		if seekSeconds > 0 {
+			fmt.Printf("Seeking forward %d seconds\n", seekSeconds)
+		} else {
+			fmt.Printf("Seeking backward %d seconds\n", -seekSeconds)
+		}
+	} else {
+		sendMpvCommand(fmt.Sprintf("seek %d absolute", seekSeconds))
+		fmt.Printf("Seeking to %d seconds\n", seekSeconds)
+	}
 }
 
 func handleListPlaylists() {
@@ -685,6 +816,12 @@ func boolToOnOff(b bool) string {
 	return "OFF"
 }
 
+func formatDuration(seconds int) string {
+	minutes := seconds / 60
+	seconds = seconds % 60
+	return fmt.Sprintf("%d:%02d", minutes, seconds)
+}
+
 func isValidPlaylistURL(url string) bool {
 	playlistRegex := regexp.MustCompile(`(?i)(?:youtube\.com/playlist\?list=|youtu\.be/playlist\?list=)([a-zA-Z0-9_-]+)`)
 	return playlistRegex.MatchString(url)
@@ -782,156 +919,227 @@ func startPlayback() {
 	config.State.IsPlaying = true
 	saveConfig()
 
-	for {
-		playlist := config.Playlists[config.State.CurrentPlaylist]
-		if playlist == nil {
-			break
-		}
-
-		currentIndex := getCurrentSongIndex()
-		if currentIndex >= len(playlist.Songs) {
-			break
-		}
-
-		song := playlist.Songs[currentIndex]
-		fmt.Printf("Now playing: %s\n", song.Title)
-
-		// Play the song using yt-dlp and a media player
-		if err := playSong(song); err != nil {
-			fmt.Printf("Error playing song: %v\n", err)
-		}
-
-		// Check if we should continue to next song
-		if !shouldContinuePlayback() {
-			break
-		}
-
-		// Move to next song
-		moveToNextSong()
-	}
-
-	config.State.IsPlaying = false
-	saveConfig()
-}
-
-func playSong(song Song) error {
-	// Get audio stream URL using yt-dlp
-	cmd := exec.Command("yt-dlp", "-f", "bestaudio", "--get-url", song.URL)
-	output, err := cmd.Output()
-	if err != nil {
-		return fmt.Errorf("failed to get audio URL: %v", err)
-	}
-
-	audioURL := strings.TrimSpace(string(output))
-
-	// Play using ffplay (part of ffmpeg) with volume control
-	volumeFilter := fmt.Sprintf("volume=%f", float64(config.State.Volume)/100.0)
-	currentCmd = exec.Command("ffplay", "-nodisp", "-autoexit", "-af", volumeFilter, audioURL)
-
-	// Start the command
-	if err := currentCmd.Start(); err != nil {
-		return fmt.Errorf("failed to start audio player: %v", err)
-	}
-
-	// Wait for completion or skip signal
-	done := make(chan error)
-	go func() {
-		done <- currentCmd.Wait()
-	}()
-
-	select {
-	case <-skipChannel:
-		// Skip requested
-		if currentCmd.Process != nil {
-			currentCmd.Process.Kill()
-		}
-		return nil
-	case <-quitChannel:
-		// Quit requested
-		if currentCmd.Process != nil {
-			currentCmd.Process.Kill()
-		}
-		return fmt.Errorf("playback stopped")
-	case err := <-done:
-		// Song finished naturally
-		currentCmd = nil
-		return err
-	}
-}
-
-func shouldContinuePlayback() bool {
 	playlist := config.Playlists[config.State.CurrentPlaylist]
 	if playlist == nil {
-		return false
+		config.State.IsPlaying = false
+		saveConfig()
+		return
 	}
 
-	if config.State.IsShuffle {
-		// Check if we've reached the end of the shuffle order
-		if config.State.ShuffleIndex >= len(config.State.ShuffleOrder)-1 {
-			if config.State.IsLoop {
-				// Restart shuffle
-				initShuffleOrder()
-				return true
-			}
-			return false
-		}
-	} else {
-		// Check if we've reached the end of the playlist
-		if config.State.CurrentSongIndex >= len(playlist.Songs)-1 {
-			if config.State.IsLoop {
-				// Restart playlist
-				config.State.CurrentSongIndex = 0
-				return true
-			}
-			return false
-		}
+	// Create temporary playlist file for mpv
+	playlistFile := filepath.Join(config.DataDir, "current_playlist.m3u")
+	if err := createPlaylistFile(playlist, playlistFile); err != nil {
+		fmt.Printf("Error creating playlist file: %v\n", err)
+		config.State.IsPlaying = false
+		saveConfig()
+		return
 	}
 
-	return true
+	// Start mpv with the playlist
+	if err := startMpv(playlistFile); err != nil {
+		fmt.Printf("Error starting mpv: %v\n", err)
+		config.State.IsPlaying = false
+		saveConfig()
+		return
+	}
+
+	// Monitor mpv in a separate goroutine
+	go monitorMpv()
+
+	// Wait for mpv to finish
+	currentCmd.Wait()
+	config.State.IsPlaying = false
+	saveConfig()
+
+	// Clean up playlist file
+	os.Remove(playlistFile)
 }
 
-func moveToNextSong() {
-	if config.State.IsShuffle {
-		config.State.ShuffleIndex++
-	} else {
-		config.State.CurrentSongIndex++
+func monitorMpv() {
+	for config.State.IsPlaying {
+		time.Sleep(1 * time.Second)
+		// Check if mpv process is still running
+		if currentCmd == nil || currentCmd.ProcessState != nil {
+			// mpv has exited
+			config.State.IsPlaying = false
+			saveConfig()
+			return
+		}
+
+		// Get current position from mpv
+		pos := getMpvPosition()
+		if pos >= 0 {
+			config.State.Position = pos
+		}
+
+		// Update current song index based on mpv's playlist position
+		// This is crucial for shuffle mode and accurate state tracking
+		cmd := exec.Command("sh", "-c", fmt.Sprintf(`echo '{"command": ["get_property", "playlist-pos"]}' | socat - %s`, config.SocketFile))
+		output, err := cmd.Output()
+		if err == nil {
+			var response map[string]interface{}
+			if json.Unmarshal(output, &response) == nil {
+				if data, ok := response["data"].(float64); ok {
+					mpvPlaylistPos := int(data)
+
+					// If shuffle is on, mpvPlaylistPos is the index in the shuffled list
+					// We need to find the original song index from our shuffle order
+					if config.State.IsShuffle {
+						if mpvPlaylistPos < len(config.State.ShuffleOrder) {
+							config.State.ShuffleIndex = mpvPlaylistPos
+							config.State.CurrentSongIndex = config.State.ShuffleOrder[mpvPlaylistPos]
+						}
+					} else {
+						config.State.CurrentSongIndex = mpvPlaylistPos
+					}
+					saveConfig()
+				}
+			}
+		}
 	}
-	saveConfig()
+}
+
+func createPlaylistFile(playlist *Playlist, filename string) error {
+	file, err := os.Create(filename)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+
+	file.WriteString("#EXTM3U\n")
+
+	var songsToWrite []Song
+	if config.State.IsShuffle {
+		// Write songs in shuffle order
+		for _, index := range config.State.ShuffleOrder {
+			if index < len(playlist.Songs) {
+				songsToWrite = append(songsToWrite, playlist.Songs[index])
+			}
+		}
+	} else {
+		songsToWrite = playlist.Songs
+	}
+
+	for _, song := range songsToWrite {
+		file.WriteString(fmt.Sprintf("#EXTINF:-1,%s\n", song.Title))
+		file.WriteString(fmt.Sprintf("%s\n", song.URL))
+	}
+
+	return nil
+}
+
+func startMpv(playlistFile string) error {
+	// Clean up old socket
+	os.Remove(config.SocketFile)
+
+	args := []string{
+		"--no-video",
+		"--input-ipc-server=" + config.SocketFile,
+		"--volume=" + strconv.Itoa(config.State.Volume),
+		"--playlist=" + playlistFile,
+		"--playlist-start=" + strconv.Itoa(config.State.CurrentSongIndex),
+	}
+
+	if config.State.IsLoop {
+		args = append(args, "--loop-playlist=inf")
+	}
+
+	if config.State.IsShuffle {
+		args = append(args, "--shuffle")
+	}
+
+	// Add terminal control for better interaction
+	args = append(args, "--input-terminal=yes", "--terminal=yes")
+
+	currentCmd = exec.Command("mpv", args...)
+	currentCmd.Stdout = os.Stdout
+	currentCmd.Stderr = os.Stderr
+
+	fmt.Printf("Starting playback with mpv...\n")
+	return currentCmd.Start()
+}
+
+func sendMpvCommand(command string) error {
+	if _, err := os.Stat(config.SocketFile); os.IsNotExist(err) {
+		return fmt.Errorf("mpv socket not found")
+	}
+
+	// Parse command into proper JSON format
+	var jsonCmd string
+	parts := strings.Fields(command)
+	if len(parts) == 1 {
+		jsonCmd = fmt.Sprintf(`{"command": ["%s"]}`, parts[0])
+	} else if len(parts) == 2 {
+		jsonCmd = fmt.Sprintf(`{"command": ["%s", "%s"]}`, parts[0], parts[1])
+	} else if len(parts) == 3 {
+		jsonCmd = fmt.Sprintf(`{"command": ["%s", "%s", "%s"]}`, parts[0], parts[1], parts[2])
+	} else {
+		jsonCmd = fmt.Sprintf(`{"command": ["%s"]}`, parts[0])
+	}
+
+	// Send command via socat
+	cmd := exec.Command("sh", "-c", fmt.Sprintf(`echo '%s' | socat - %s`, jsonCmd, config.SocketFile))
+	return cmd.Run()
+}
+
+func getMpvPosition() int {
+	if _, err := os.Stat(config.SocketFile); os.IsNotExist(err) {
+		return -1
+	}
+
+	// Query current position from mpv
+	cmd := exec.Command("sh", "-c", fmt.Sprintf(`echo '{"command": ["get_property", "time-pos"]}' | socat - %s`, config.SocketFile))
+	output, err := cmd.Output()
+	if err != nil {
+		return -1
+	}
+
+	// Parse JSON response (simplified)
+	var response map[string]interface{}
+	if err := json.Unmarshal(output, &response); err != nil {
+		return -1
+	}
+
+	if data, ok := response["data"].(float64); ok {
+		return int(data)
+	}
+
+	return -1
 }
 
 func showHelp() {
-	fmt.Println(`MFP - Music From Playlists
-A command-line YouTube playlist music player
-
-PLAYLIST MANAGEMENT:
-  mfp add <name> <url>         Add YouTube playlist
-  mfp list                     Show all playlists
-  mfp songs <playlist>         Show songs in playlist
-  mfp rename <old> <new>       Rename playlist
-  mfp delete <playlist>        Delete playlist
-
-PLAYBACK CONTROLS:
-  mfp play [playlist]          Start/resume playback
-  mfp stop                     Stop playback
-  mfp next                     Skip to next song
-  mfp prev                     Go to previous song
-  mfp jump <number>            Jump to specific song
-
-QUEUE & INFO:
-  mfp current                  Show currently playing song
-  mfp queue [count]            Show queue (default: 5 songs each way)
-  mfp status                   Show player status
-
-SETTINGS:
-  mfp shuffle [on|off]         Toggle/set shuffle mode
-  mfp loop [on|off]            Toggle/set loop mode
-  mfp volume [up|down|0-100]   Control volume
-  mfp seek [+|-]<seconds>      Seek forward/backward (future feature)
-
-EXAMPLES:
-  mfp add mymusic "https://www.youtube.com/playlist?list=PLx..."
-  mfp play mymusic
-  mfp volume 80
-  mfp shuffle on
-  mfp queue 10`)
+	fmt.Println("MFP - Music From Playlists")
+	fmt.Println("A terminal-based YouTube playlist music player")
+	fmt.Println()
+	fmt.Println("Commands:")
+	fmt.Println("  add <name> <url>        Add a YouTube playlist")
+	fmt.Println("  play [playlist]         Start/resume playback")
+	fmt.Println("  stop                    Stop playback")
+	fmt.Println("  next                    Skip to next song")
+	fmt.Println("  prev/previous           Go to previous song")
+	fmt.Println("  current/now             Show current playing song")
+	fmt.Println("  queue [count]           Show playlist queue")
+	fmt.Println("  jump <number>           Jump to specific song")
+	fmt.Println("  shuffle [on|off]        Toggle/set shuffle mode")
+	fmt.Println("  loop [on|off]           Toggle/set loop mode")
+	fmt.Println("  volume/vol [up|down|N]  Control volume (0-100)")
+	fmt.Println("  seek [+|-]<seconds>     Seek in current song")
+	fmt.Println("  list/playlists          List all playlists")
+	fmt.Println("  songs <playlist>        List songs in playlist")
+	fmt.Println("  rename <old> <new>      Rename a playlist")
+	fmt.Println("  delete/remove <name>    Delete a playlist")
+	fmt.Println("  status                  Show player status")
+	fmt.Println("  help                    Show this help")
+	fmt.Println()
+	fmt.Println("Examples:")
+	fmt.Println("  mfp add rock https://www.youtube.com/playlist?list=PLxxx...")
+	fmt.Println("  mfp play rock")
+	fmt.Println("  mfp volume 80")
+	fmt.Println("  mfp shuffle on")
+	fmt.Println("  mfp jump 5")
+	fmt.Println()
+	fmt.Println("Requirements:")
+	fmt.Println("  - mpv (media player)")
+	fmt.Println("  - yt-dlp (YouTube downloader)")
+	fmt.Println("  - socat (socket communication)")
 }
