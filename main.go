@@ -255,39 +255,6 @@ func handleAdd(args []string) {
 	fmt.Printf("Successfully added playlist '%s' with %d songs\n", name, len(songs))
 }
 
-func handlePlay(args []string) {
-	if len(args) == 0 {
-		// Resume current playlist if available
-		if config.State.CurrentPlaylist == "" {
-			fmt.Println("No playlist specified. Use: mfp play <playlist_name>")
-			return
-		}
-	} else {
-		// Start new playlist
-		playlistName := args[0]
-		if _, exists := config.Playlists[playlistName]; !exists {
-			fmt.Printf("Playlist '%s' not found\n", playlistName)
-			return
-		}
-		config.State.CurrentPlaylist = playlistName
-		config.State.CurrentSongIndex = 0
-		config.State.Position = 0
-
-		// Initialize shuffle order if shuffle is enabled
-		if config.State.IsShuffle {
-			initShuffleOrder()
-		}
-	}
-
-	if config.State.IsPlaying {
-		fmt.Println("Already playing. Use 'mfp stop' to stop current playback.")
-		return
-	}
-
-	go startPlayback()
-	fmt.Printf("Started playing playlist: %s\n", config.State.CurrentPlaylist)
-}
-
 func handleStop() {
 	if currentCmd != nil && currentCmd.Process != nil {
 		// Send quit command to mpv first for graceful shutdown
@@ -385,44 +352,6 @@ func handlePrevious() {
 	sendMpvCommand("playlist-prev")
 	saveConfig()
 	fmt.Println("Going to previous song...")
-}
-
-func handleCurrent() {
-	if config.State.CurrentPlaylist == "" {
-		fmt.Println("No playlist is currently loaded")
-		return
-	}
-
-	playlist := config.Playlists[config.State.CurrentPlaylist]
-	if playlist == nil {
-		fmt.Println("Current playlist not found")
-		return
-	}
-
-	currentIndex := getCurrentSongIndex()
-	if currentIndex >= len(playlist.Songs) {
-		fmt.Println("No current song")
-		return
-	}
-
-	song := playlist.Songs[currentIndex]
-	status := "Paused"
-	if config.State.IsPlaying {
-		status = "Playing"
-	}
-
-	fmt.Printf("Current Song (%s):\n", status)
-	fmt.Printf("  Title: %s\n", song.Title)
-	fmt.Printf("  Duration: %s\n", song.Duration)
-	fmt.Printf("  Position: %d/%d in playlist\n", currentIndex+1, len(playlist.Songs))
-	fmt.Printf("  Playlist: %s\n", config.State.CurrentPlaylist)
-
-	// Try to get current position from mpv
-	if config.State.IsPlaying {
-		if pos := getMpvPosition(); pos >= 0 {
-			fmt.Printf("  Time: %s\n", formatDuration(pos))
-		}
-	}
 }
 
 func handleQueue(args []string) {
@@ -915,15 +844,20 @@ func initShuffleOrder() {
 	config.State.ShuffleIndex = 0
 }
 
-func startPlayback() {
-	config.State.IsPlaying = true
-	saveConfig()
+// Key fixes for the MFP player state management issues
 
+// Fix 1: Improve startPlayback function
+func startPlayback() {
 	playlist := config.Playlists[config.State.CurrentPlaylist]
 	if playlist == nil {
-		config.State.IsPlaying = false
-		saveConfig()
+		fmt.Println("Error: Current playlist not found")
 		return
+	}
+
+	// Set state BEFORE starting mpv
+	config.State.IsPlaying = true
+	if err := saveConfig(); err != nil {
+		fmt.Printf("Error saving state: %v\n", err)
 	}
 
 	// Create temporary playlist file for mpv
@@ -943,58 +877,221 @@ func startPlayback() {
 		return
 	}
 
-	// Monitor mpv in a separate goroutine
+	fmt.Printf("MPV started successfully for playlist: %s\n", config.State.CurrentPlaylist)
+
+	// Start monitoring in background
 	go monitorMpv()
 
-	// Wait for mpv to finish
-	currentCmd.Wait()
-	config.State.IsPlaying = false
-	saveConfig()
-
-	// Clean up playlist file
-	os.Remove(playlistFile)
+	// Don't wait here - let it run in background
+	// The Wait() should be handled in the monitor goroutine
 }
 
-func monitorMpv() {
-	for config.State.IsPlaying {
-		time.Sleep(1 * time.Second)
-		// Check if mpv process is still running
-		if currentCmd == nil || currentCmd.ProcessState != nil {
-			// mpv has exited
-			config.State.IsPlaying = false
-			saveConfig()
+// Fix 2: Improve handlePlay function
+func handlePlay(args []string) {
+	if len(args) == 0 {
+		// Resume current playlist if available
+		if config.State.CurrentPlaylist == "" {
+			fmt.Println("No playlist specified. Use: mfp play <playlist_name>")
+			return
+		}
+		fmt.Printf("Resuming playlist: %s\n", config.State.CurrentPlaylist)
+	} else {
+		// Start new playlist
+		playlistName := args[0]
+		if _, exists := config.Playlists[playlistName]; !exists {
+			fmt.Printf("Playlist '%s' not found\n", playlistName)
 			return
 		}
 
-		// Get current position from mpv
+		// Stop current playback if any
+		if config.State.IsPlaying {
+			handleStop()
+			time.Sleep(500 * time.Millisecond) // Give time for cleanup
+		}
+
+		config.State.CurrentPlaylist = playlistName
+		config.State.CurrentSongIndex = 0
+		config.State.Position = 0
+
+		// Initialize shuffle order if shuffle is enabled
+		if config.State.IsShuffle {
+			initShuffleOrder()
+		}
+
+		fmt.Printf("Loading playlist: %s\n", playlistName)
+	}
+
+	if config.State.IsPlaying {
+		fmt.Println("Already playing. Use 'mfp stop' to stop current playback.")
+		return
+	}
+
+	// Start playback - this should run in background
+	go startPlayback()
+
+	// Give it a moment to start, then confirm
+	time.Sleep(1 * time.Second)
+	if config.State.IsPlaying {
+		fmt.Printf("Started playing playlist: %s\n", config.State.CurrentPlaylist)
+	} else {
+		fmt.Println("Failed to start playback")
+	}
+}
+
+// Fix 3: Improve monitorMpv function
+func monitorMpv() {
+	defer func() {
+		config.State.IsPlaying = false
+		saveConfig()
+		if currentCmd != nil {
+			currentCmd = nil
+		}
+	}()
+
+	// Wait for socket to be available
+	maxWait := 10 // seconds
+	for i := 0; i < maxWait; i++ {
+		if _, err := os.Stat(config.SocketFile); err == nil {
+			break
+		}
+		time.Sleep(time.Second)
+		if i == maxWait-1 {
+			fmt.Println("Error: MPV socket not created, playback may have failed")
+			return
+		}
+	}
+
+	fmt.Println("MPV connection established")
+
+	for {
+		if currentCmd == nil {
+			break
+		}
+
+		// Check if process is still running
+		if currentCmd.ProcessState != nil {
+			fmt.Println("MPV process ended")
+			break
+		}
+
+		// Update position and playlist position
 		pos := getMpvPosition()
 		if pos >= 0 {
 			config.State.Position = pos
 		}
 
 		// Update current song index based on mpv's playlist position
-		// This is crucial for shuffle mode and accurate state tracking
-		cmd := exec.Command("sh", "-c", fmt.Sprintf(`echo '{"command": ["get_property", "playlist-pos"]}' | socat - %s`, config.SocketFile))
-		output, err := cmd.Output()
-		if err == nil {
-			var response map[string]interface{}
-			if json.Unmarshal(output, &response) == nil {
-				if data, ok := response["data"].(float64); ok {
-					mpvPlaylistPos := int(data)
-
-					// If shuffle is on, mpvPlaylistPos is the index in the shuffled list
-					// We need to find the original song index from our shuffle order
-					if config.State.IsShuffle {
-						if mpvPlaylistPos < len(config.State.ShuffleOrder) {
-							config.State.ShuffleIndex = mpvPlaylistPos
-							config.State.CurrentSongIndex = config.State.ShuffleOrder[mpvPlaylistPos]
-						}
-					} else {
-						config.State.CurrentSongIndex = mpvPlaylistPos
-					}
-					saveConfig()
+		if playlistPos := getMpvPlaylistPosition(); playlistPos >= 0 {
+			if config.State.IsShuffle {
+				if playlistPos < len(config.State.ShuffleOrder) {
+					config.State.ShuffleIndex = playlistPos
 				}
+			} else {
+				config.State.CurrentSongIndex = playlistPos
 			}
+			saveConfig()
+		}
+
+		time.Sleep(2 * time.Second)
+	}
+}
+
+// Fix 4: Add helper function to get playlist position
+func getMpvPlaylistPosition() int {
+	if _, err := os.Stat(config.SocketFile); os.IsNotExist(err) {
+		return -1
+	}
+
+	cmd := exec.Command("sh", "-c", fmt.Sprintf(`echo '{"command": ["get_property", "playlist-pos"]}' | socat - %s 2>/dev/null`, config.SocketFile))
+	output, err := cmd.Output()
+	if err != nil {
+		return -1
+	}
+
+	var response map[string]interface{}
+	if err := json.Unmarshal(output, &response); err != nil {
+		return -1
+	}
+
+	if data, ok := response["data"].(float64); ok {
+		return int(data)
+	}
+
+	return -1
+}
+
+// Fix 5: Improve startMpv function
+func startMpv(playlistFile string) error {
+	// Clean up old socket
+	os.Remove(config.SocketFile)
+
+	startIndex := config.State.CurrentSongIndex
+	if config.State.IsShuffle {
+		startIndex = config.State.ShuffleIndex
+	}
+
+	args := []string{
+		"--no-video",
+		"--no-terminal", // Run in background
+		"--input-ipc-server=" + config.SocketFile,
+		"--volume=" + strconv.Itoa(config.State.Volume),
+		"--playlist=" + playlistFile,
+		"--playlist-start=" + strconv.Itoa(startIndex),
+		"--quiet", // Reduce output noise
+	}
+
+	if config.State.IsLoop {
+		args = append(args, "--loop-playlist=inf")
+	}
+
+	currentCmd = exec.Command("mpv", args...)
+
+	// Don't pipe stdout/stderr to avoid blocking
+	currentCmd.Stdout = nil
+	currentCmd.Stderr = nil
+
+	if err := currentCmd.Start(); err != nil {
+		return fmt.Errorf("failed to start mpv: %v", err)
+	}
+
+	return nil
+}
+
+// Fix 6: Improve handleCurrent function
+func handleCurrent() {
+	if config.State.CurrentPlaylist == "" {
+		fmt.Println("No playlist is currently loaded")
+		return
+	}
+
+	playlist := config.Playlists[config.State.CurrentPlaylist]
+	if playlist == nil {
+		fmt.Println("Current playlist not found")
+		return
+	}
+
+	currentIndex := getCurrentSongIndex()
+	if currentIndex >= len(playlist.Songs) || currentIndex < 0 {
+		fmt.Println("No current song")
+		return
+	}
+
+	song := playlist.Songs[currentIndex]
+	status := "Paused"
+	if config.State.IsPlaying {
+		status = "Playing"
+	}
+
+	fmt.Printf("Current Song (%s):\n", status)
+	fmt.Printf("  Title: %s\n", song.Title)
+	fmt.Printf("  Duration: %s\n", song.Duration)
+	fmt.Printf("  Position: %d/%d in playlist\n", currentIndex+1, len(playlist.Songs))
+	fmt.Printf("  Playlist: %s\n", config.State.CurrentPlaylist)
+
+	// Try to get current position from mpv
+	if config.State.IsPlaying {
+		if pos := getMpvPosition(); pos >= 0 {
+			fmt.Printf("  Time: %s\n", formatDuration(pos))
 		}
 	}
 }
@@ -1026,37 +1123,6 @@ func createPlaylistFile(playlist *Playlist, filename string) error {
 	}
 
 	return nil
-}
-
-func startMpv(playlistFile string) error {
-	// Clean up old socket
-	os.Remove(config.SocketFile)
-
-	args := []string{
-		"--no-video",
-		"--input-ipc-server=" + config.SocketFile,
-		"--volume=" + strconv.Itoa(config.State.Volume),
-		"--playlist=" + playlistFile,
-		"--playlist-start=" + strconv.Itoa(config.State.CurrentSongIndex),
-	}
-
-	if config.State.IsLoop {
-		args = append(args, "--loop-playlist=inf")
-	}
-
-	if config.State.IsShuffle {
-		args = append(args, "--shuffle")
-	}
-
-	// Add terminal control for better interaction
-	args = append(args, "--input-terminal=yes", "--terminal=yes")
-
-	currentCmd = exec.Command("mpv", args...)
-	currentCmd.Stdout = os.Stdout
-	currentCmd.Stderr = os.Stderr
-
-	fmt.Printf("Starting playback with mpv...\n")
-	return currentCmd.Start()
 }
 
 func sendMpvCommand(command string) error {
