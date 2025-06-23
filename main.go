@@ -808,16 +808,6 @@ func fetchPlaylistSongs(playlistID string) ([]Song, error) {
 	return songs, nil
 }
 
-func getCurrentSongIndex() int {
-	if config.State.IsShuffle {
-		if config.State.ShuffleIndex < len(config.State.ShuffleOrder) {
-			return config.State.ShuffleOrder[config.State.ShuffleIndex]
-		}
-		return 0
-	}
-	return config.State.CurrentSongIndex
-}
-
 func initShuffleOrder() {
 	if config.State.CurrentPlaylist == "" {
 		return
@@ -846,7 +836,7 @@ func initShuffleOrder() {
 
 // Key fixes for the MFP player state management issues
 
-// Fix 1: Improve startPlayback function
+// Improve startPlayback function
 func startPlayback() {
 	playlist := config.Playlists[config.State.CurrentPlaylist]
 	if playlist == nil {
@@ -886,7 +876,7 @@ func startPlayback() {
 	// The Wait() should be handled in the monitor goroutine
 }
 
-// Fix 2: Improve handlePlay function
+// Improve handlePlay function
 func handlePlay(args []string) {
 	if len(args) == 0 {
 		// Resume current playlist if available
@@ -938,7 +928,7 @@ func handlePlay(args []string) {
 	}
 }
 
-// Fix 3: Improve monitorMpv function
+// Fixed monitorMpv function to properly track current song
 func monitorMpv() {
 	defer func() {
 		config.State.IsPlaying = false
@@ -946,6 +936,8 @@ func monitorMpv() {
 		if currentCmd != nil {
 			currentCmd = nil
 		}
+		// Clean up socket file
+		os.Remove(config.SocketFile)
 	}()
 
 	// Wait for socket to be available
@@ -962,6 +954,7 @@ func monitorMpv() {
 	}
 
 	fmt.Println("MPV connection established")
+	lastPlaylistPos := -1 // Track the last known position to detect changes
 
 	for {
 		if currentCmd == nil {
@@ -974,35 +967,60 @@ func monitorMpv() {
 			break
 		}
 
-		// Update position and playlist position
+		// Update position
 		pos := getMpvPosition()
 		if pos >= 0 {
 			config.State.Position = pos
 		}
 
 		// Update current song index based on mpv's playlist position
-		if playlistPos := getMpvPlaylistPosition(); playlistPos >= 0 {
-			if config.State.IsShuffle {
-				if playlistPos < len(config.State.ShuffleOrder) {
-					config.State.ShuffleIndex = playlistPos
+		playlistPos := getMpvPlaylistPosition()
+		if playlistPos >= 0 && playlistPos != lastPlaylistPos {
+			// MPV playlist position changed - update our state
+			lastPlaylistPos = playlistPos
+
+			playlist := config.Playlists[config.State.CurrentPlaylist]
+			if playlist != nil {
+				if config.State.IsShuffle {
+					// In shuffle mode, playlistPos is the index in the shuffled order
+					if playlistPos < len(config.State.ShuffleOrder) {
+						config.State.ShuffleIndex = playlistPos
+						config.State.CurrentSongIndex = config.State.ShuffleOrder[playlistPos]
+					}
+				} else {
+					// In normal mode, playlistPos is the direct song index
+					if playlistPos < len(playlist.Songs) {
+						config.State.CurrentSongIndex = playlistPos
+					}
 				}
-			} else {
-				config.State.CurrentSongIndex = playlistPos
+
+				// Save the updated state
+				if err := saveConfig(); err == nil {
+					// Optional: Print song change notification
+					if playlistPos < len(playlist.Songs) {
+						currentIndex := getCurrentSongIndex()
+						if currentIndex < len(playlist.Songs) {
+							fmt.Printf("Now playing: %s\n", playlist.Songs[currentIndex].Title)
+						}
+					}
+				}
 			}
-			saveConfig()
 		}
 
-		time.Sleep(2 * time.Second)
+		time.Sleep(1 * time.Second) // Check every second for better responsiveness
 	}
 }
 
-// Fix 4: Add helper function to get playlist position
+// Improved getMpvPlaylistPosition with better error handling
 func getMpvPlaylistPosition() int {
 	if _, err := os.Stat(config.SocketFile); os.IsNotExist(err) {
 		return -1
 	}
 
-	cmd := exec.Command("sh", "-c", fmt.Sprintf(`echo '{"command": ["get_property", "playlist-pos"]}' | socat - %s 2>/dev/null`, config.SocketFile))
+	// Use timeout to prevent hanging
+	cmd := exec.Command("timeout", "2s", "sh", "-c",
+		fmt.Sprintf(`echo '{"command": ["get_property", "playlist-pos"]}' | socat - %s 2>/dev/null`, config.SocketFile))
+
 	output, err := cmd.Output()
 	if err != nil {
 		return -1
@@ -1020,7 +1038,62 @@ func getMpvPlaylistPosition() int {
 	return -1
 }
 
-// Fix 5: Improve startMpv function
+// Improved getMpvPosition with better error handling
+func getMpvPosition() int {
+	if _, err := os.Stat(config.SocketFile); os.IsNotExist(err) {
+		return -1
+	}
+
+	// Use timeout to prevent hanging
+	cmd := exec.Command("timeout", "2s", "sh", "-c",
+		fmt.Sprintf(`echo '{"command": ["get_property", "time-pos"]}' | socat - %s 2>/dev/null`, config.SocketFile))
+
+	output, err := cmd.Output()
+	if err != nil {
+		return -1
+	}
+
+	var response map[string]interface{}
+	if err := json.Unmarshal(output, &response); err != nil {
+		return -1
+	}
+
+	if data, ok := response["data"].(float64); ok {
+		return int(data)
+	}
+
+	return -1
+}
+
+// Improved the getCurrentSongIndex function for better safety
+func getCurrentSongIndex() int {
+	if config.State.CurrentPlaylist == "" {
+		return 0
+	}
+
+	playlist := config.Playlists[config.State.CurrentPlaylist]
+	if playlist == nil {
+		return 0
+	}
+
+	if config.State.IsShuffle {
+		if config.State.ShuffleIndex >= 0 && config.State.ShuffleIndex < len(config.State.ShuffleOrder) {
+			shuffledIndex := config.State.ShuffleOrder[config.State.ShuffleIndex]
+			if shuffledIndex >= 0 && shuffledIndex < len(playlist.Songs) {
+				return shuffledIndex
+			}
+		}
+		return 0
+	}
+
+	if config.State.CurrentSongIndex >= 0 && config.State.CurrentSongIndex < len(playlist.Songs) {
+		return config.State.CurrentSongIndex
+	}
+
+	return 0
+}
+
+// Improve startMpv function
 func startMpv(playlistFile string) error {
 	// Clean up old socket
 	os.Remove(config.SocketFile)
@@ -1057,7 +1130,7 @@ func startMpv(playlistFile string) error {
 	return nil
 }
 
-// Fix 6: Improve handleCurrent function
+// Improve handleCurrent function
 func handleCurrent() {
 	if config.State.CurrentPlaylist == "" {
 		fmt.Println("No playlist is currently loaded")
@@ -1146,31 +1219,6 @@ func sendMpvCommand(command string) error {
 	// Send command via socat
 	cmd := exec.Command("sh", "-c", fmt.Sprintf(`echo '%s' | socat - %s`, jsonCmd, config.SocketFile))
 	return cmd.Run()
-}
-
-func getMpvPosition() int {
-	if _, err := os.Stat(config.SocketFile); os.IsNotExist(err) {
-		return -1
-	}
-
-	// Query current position from mpv
-	cmd := exec.Command("sh", "-c", fmt.Sprintf(`echo '{"command": ["get_property", "time-pos"]}' | socat - %s`, config.SocketFile))
-	output, err := cmd.Output()
-	if err != nil {
-		return -1
-	}
-
-	// Parse JSON response (simplified)
-	var response map[string]interface{}
-	if err := json.Unmarshal(output, &response); err != nil {
-		return -1
-	}
-
-	if data, ok := response["data"].(float64); ok {
-		return int(data)
-	}
-
-	return -1
 }
 
 func showHelp() {
